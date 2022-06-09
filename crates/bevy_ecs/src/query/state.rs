@@ -10,7 +10,7 @@ use crate::{
     storage::TableId,
     world::{World, WorldId},
 };
-use bevy_tasks::{ComputeTaskPool, TaskPool};
+use bevy_tasks::{TaskGroup, TaskPool};
 #[cfg(feature = "trace")]
 use bevy_utils::tracing::Instrument;
 use fixedbitset::FixedBitSet;
@@ -63,7 +63,7 @@ impl<Q: WorldQuery, F: WorldQuery> QueryState<Q, F> {
         let mut state = Self {
             world_id: world.id(),
             task_pool: world
-                .get_resource::<ComputeTaskPool>()
+                .get_resource::<TaskPool>()
                 .map(|task_pool| task_pool.deref().clone()),
             archetype_generation: ArchetypeGeneration::initial(),
             matched_table_ids: Vec::new(),
@@ -754,7 +754,7 @@ impl<Q: WorldQuery, F: WorldQuery> QueryState<Q, F> {
     /// write-queries.
     ///
     /// # Panics
-    /// The [`ComputeTaskPool`] resource must be added to the `World` before using this method. If using this from a query
+    /// The [`TaskPool`] resource must be added to the `World` before using this method. If using this from a query
     /// that is being initialized and run from the ECS scheduler, this should never panic.
     #[inline]
     pub fn par_for_each<'w, FN: Fn(ROQueryItem<'w, Q>) + Send + Sync + Clone>(
@@ -779,7 +779,7 @@ impl<Q: WorldQuery, F: WorldQuery> QueryState<Q, F> {
     /// Runs `func` on each query result in parallel.
     ///
     /// # Panics
-    /// The [`ComputeTaskPool`] resource must be added to the `World` before using this method. If using this from a query
+    /// The [`TaskPool`] resource must be added to the `World` before using this method. If using this from a query
     /// that is being initialized and run from the ECS scheduler, this should never panic.
     #[inline]
     pub fn par_for_each_mut<'w, FN: Fn(QueryItem<'w, Q>) + Send + Sync + Clone>(
@@ -806,7 +806,7 @@ impl<Q: WorldQuery, F: WorldQuery> QueryState<Q, F> {
     /// This can only be called for read-only queries.
     ///
     /// # Panics
-    /// [`ComputeTaskPool`] was not stored in the world at initialzation. If using this from a query
+    /// [`TaskPool`] was not stored in the world at initialzation. If using this from a query
     /// that is being initialized and run from the ECS scheduler, this should never panic.
     ///
     /// # Safety
@@ -922,7 +922,7 @@ impl<Q: WorldQuery, F: WorldQuery> QueryState<Q, F> {
     /// iter() method, but cannot be chained like a normal [`Iterator`].
     ///
     /// # Panics
-    /// [`ComputeTaskPool`] was not stored in the world at initialzation. If using this from a query
+    /// [`TaskPool`] was not stored in the world at initialzation. If using this from a query
     /// that is being initialized and run from the ECS scheduler, this should never panic.
     ///
     /// # Safety
@@ -947,8 +947,8 @@ impl<Q: WorldQuery, F: WorldQuery> QueryState<Q, F> {
         // QueryIter, QueryIterationCursor, QueryState::for_each_unchecked_manual, QueryState::many_for_each_unchecked_manual, QueryState::par_for_each_unchecked_manual
         self.task_pool
             .as_ref()
-            .expect("Cannot iterate query in parallel. No ComputeTaskPool initialized.")
-            .scope(|scope| {
+            .expect("Cannot iterate query in parallel. No TaskPool initialized.")
+            .scope(TaskGroup::Compute, |scope| {
                 if QF::IS_DENSE && <QueryFetch<'static, F>>::IS_DENSE {
                     let tables = &world.storages().tables;
                     for table_id in &self.matched_table_ids {

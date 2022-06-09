@@ -1,42 +1,28 @@
+use crate::executor::LocalExecutor;
+pub use crate::task_pool_builder::TaskPoolBuilder;
+use crate::TaskGroup;
 use std::{
     future::Future,
     mem,
     sync::{Arc, Mutex},
 };
 
-/// Used to create a TaskPool
-#[derive(Debug, Default, Clone)]
-pub struct TaskPoolBuilder {}
-
-impl TaskPoolBuilder {
-    /// Creates a new TaskPoolBuilder instance
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// No op on the single threaded task pool
-    pub fn num_threads(self, _num_threads: usize) -> Self {
-        self
-    }
-
-    /// No op on the single threaded task pool
-    pub fn stack_size(self, _stack_size: usize) -> Self {
-        self
-    }
-
-    /// No op on the single threaded task pool
-    pub fn thread_name(self, _thread_name: String) -> Self {
-        self
-    }
-
-    /// Creates a new [`TaskPool`]
-    pub fn build(self) -> TaskPool {
-        TaskPool::new_internal()
-    }
-}
-
 /// A thread pool for executing tasks. Tasks are futures that are being automatically driven by
 /// the pool on threads owned by the pool. In this case - main thread only.
+///
+/// # Scheduling Semantics
+/// Each thread in the pool is assigned to one of three priority groups: Compute, IO, and Async
+/// Compute. Compute is higher priority than IO, which are both higher priority than async compute.
+/// Every task is assigned to a group upon being spawned. A lower priority thread will always prioritize
+/// its specific tasks (i.e. IO tasks on a IO thread), but will run higher priority tasks if it would
+/// otherwise be sitting idle.
+///
+/// For example, under heavy compute workloads, compute tasks will be scheduled to run on the IO and
+/// async compute thread groups, but any IO task will take precedence over any compute task on the IO
+/// threads. Likewise, async compute tasks will never be scheduled on a compute or IO thread.
+///
+/// By default, all threads in the pool are dedicated to compute group. Thread counts can be altered
+/// via [`TaskPoolBuilder`] when constructing the pool.
 #[derive(Debug, Default, Clone)]
 pub struct TaskPool {}
 
@@ -46,8 +32,7 @@ impl TaskPool {
         TaskPoolBuilder::new().build()
     }
 
-    #[allow(unused_variables)]
-    fn new_internal() -> Self {
+    pub(crate) fn new_internal(_: TaskPoolBuilder) -> Self {
         Self {}
     }
 
@@ -61,14 +46,14 @@ impl TaskPool {
     /// to spawn tasks. This function will await the completion of all tasks before returning.
     ///
     /// This is similar to `rayon::scope` and `crossbeam::scope`
-    pub fn scope<'scope, F, T>(&self, f: F) -> Vec<T>
+    #[inline]
+    pub fn scope<'scope, F, T>(&self, _: TaskGroup, f: F) -> Vec<T>
     where
         F: FnOnce(&mut Scope<'scope, T>) + 'scope + Send,
         T: Send + 'static,
     {
-        let executor = &async_executor::LocalExecutor::new();
-        let executor: &'scope async_executor::LocalExecutor<'scope> =
-            unsafe { mem::transmute(executor) };
+        let executor = &LocalExecutor::new();
+        let executor: &'scope LocalExecutor<'scope> = unsafe { mem::transmute(executor) };
 
         let mut scope = Scope {
             executor,
@@ -89,14 +74,15 @@ impl TaskPool {
 
     /// Spawns a static future onto the JS event loop. For now it is returning FakeTask
     /// instance with no-op detach method. Returning real Task is possible here, but tricky:
-    /// future is running on JS event loop, Task is running on async_executor::LocalExecutor
+    /// future is running on JS event loop, Task is running on LocalExecutor
     /// so some proxy future is needed. Moreover currently we don't have long-living
     /// LocalExecutor here (above `spawn` implementation creates temporary one)
     /// But for typical use cases it seems that current implementation should be sufficient:
     /// caller can spawn long-running future writing results to some channel / event queue
     /// and simply call detach on returned Task (like AssetServer does) - spawned future
     /// can write results to some channel / event queue.
-    pub fn spawn<T>(&self, future: impl Future<Output = T> + 'static) -> FakeTask
+    #[inline]
+    pub fn spawn<T>(&self, _: TaskGroup, future: impl Future<Output = T> + 'static) -> FakeTask
     where
         T: 'static,
     {
@@ -111,7 +97,7 @@ impl TaskPool {
     where
         T: 'static,
     {
-        self.spawn(future)
+        self.spawn(TaskGroup::Compute, future)
     }
 }
 
@@ -128,7 +114,7 @@ impl FakeTask {
 /// For more information, see [`TaskPool::scope`].
 #[derive(Debug)]
 pub struct Scope<'scope, T> {
-    executor: &'scope async_executor::LocalExecutor<'scope>,
+    executor: &'scope LocalExecutor<'scope>,
     // Vector to gather results of all futures spawned during scope run
     results: Vec<Arc<Mutex<Option<T>>>>,
 }
@@ -141,7 +127,7 @@ impl<'scope, T: Send + 'scope> Scope<'scope, T> {
     /// On the single threaded task pool, it just calls [`Scope::spawn_local`].
     ///
     /// For more information, see [`TaskPool::scope`].
-    pub fn spawn<Fut: Future<Output = T> + 'scope + Send>(&mut self, f: Fut) {
+    pub fn spawn<Fut: Future<Output = T> + 'scope>(&mut self, f: Fut) {
         self.spawn_local(f);
     }
 

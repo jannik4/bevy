@@ -3,7 +3,7 @@
 
 use bevy::{
     prelude::*,
-    tasks::{AsyncComputeTaskPool, Task},
+    tasks::{Task, TaskGroup, TaskPool},
 };
 use futures_lite::future;
 use rand::Rng;
@@ -50,12 +50,12 @@ struct ComputeTransform(Task<Transform>);
 /// work that potentially spans multiple frames/ticks. A separate
 /// system, `handle_tasks`, will poll the spawned tasks on subsequent
 /// frames/ticks, and use the results to spawn cubes
-fn spawn_tasks(mut commands: Commands, thread_pool: Res<AsyncComputeTaskPool>) {
+fn spawn_tasks(mut commands: Commands, thread_pool: Res<TaskPool>) {
     for x in 0..NUM_CUBES {
         for y in 0..NUM_CUBES {
             for z in 0..NUM_CUBES {
-                // Spawn new task on the AsyncComputeTaskPool
-                let task = thread_pool.spawn(async move {
+                // Spawn new task on the TaskPool
+                let task = thread_pool.spawn(TaskGroup::AsyncCompute, async move {
                     let mut rng = rand::thread_rng();
                     let start_time = Instant::now();
                     let duration = Duration::from_secs_f32(rng.gen_range(0.05..0.2));

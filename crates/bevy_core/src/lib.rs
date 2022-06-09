@@ -2,20 +2,19 @@
 //! This crate provides core functionality for Bevy Engine.
 
 mod name;
-mod task_pool_options;
 
 pub use bytemuck::{bytes_of, cast_slice, Pod, Zeroable};
 pub use name::*;
-pub use task_pool_options::*;
 
 pub mod prelude {
     //! The Bevy Core Prelude.
     #[doc(hidden)]
-    pub use crate::{DefaultTaskPoolOptions, Name};
+    pub use crate::Name;
 }
 
 use bevy_app::prelude::*;
 use bevy_ecs::entity::Entity;
+use bevy_tasks::TaskPool;
 use bevy_utils::HashSet;
 use std::ops::Range;
 
@@ -25,12 +24,8 @@ pub struct CorePlugin;
 
 impl Plugin for CorePlugin {
     fn build(&self, app: &mut App) {
-        // Setup the default bevy task pools
-        app.world
-            .get_resource::<DefaultTaskPoolOptions>()
-            .cloned()
-            .unwrap_or_default()
-            .create_default_pools(&mut app.world);
+        // Setup the default bevy task pool if not already set up
+        app.world.init_resource::<TaskPool>();
 
         app.register_type::<Entity>().register_type::<Name>();
 

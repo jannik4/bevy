@@ -1,3 +1,4 @@
+use crate::executor::{Executor, LocalExecutor};
 use std::{
     future::Future,
     mem,
@@ -6,62 +7,26 @@ use std::{
     thread::{self, JoinHandle},
 };
 
+pub use crate::task_pool_builder::*;
 use futures_lite::{future, pin};
 
-use crate::Task;
+use crate::{Task, TaskGroup};
 
-/// Used to create a [`TaskPool`]
-#[derive(Debug, Default, Clone)]
-#[must_use]
-pub struct TaskPoolBuilder {
-    /// If set, we'll set up the thread pool to use at most n threads. Otherwise use
-    /// the logical core count of the system
-    num_threads: Option<usize>,
-    /// If set, we'll use the given stack size rather than the system default
-    stack_size: Option<usize>,
-    /// Allows customizing the name of the threads - helpful for debugging. If set, threads will
-    /// be named <thread_name> (<thread_index>), i.e. "MyThreadPool (2)"
-    thread_name: Option<String>,
-}
-
-impl TaskPoolBuilder {
-    /// Creates a new [`TaskPoolBuilder`] instance
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Override the number of threads created for the pool. If unset, we default to the number
-    /// of logical cores of the system
-    pub fn num_threads(mut self, num_threads: usize) -> Self {
-        self.num_threads = Some(num_threads);
-        self
-    }
-
-    /// Override the stack size of the threads created for the pool
-    pub fn stack_size(mut self, stack_size: usize) -> Self {
-        self.stack_size = Some(stack_size);
-        self
-    }
-
-    /// Override the name of the threads created for the pool. If set, threads will
-    /// be named `<thread_name> (<thread_index>)`, i.e. `MyThreadPool (2)`
-    pub fn thread_name(mut self, thread_name: String) -> Self {
-        self.thread_name = Some(thread_name);
-        self
-    }
-
-    /// Creates a new [`TaskPool`] based on the current options.
-    pub fn build(self) -> TaskPool {
-        TaskPool::new_internal(
-            self.num_threads,
-            self.stack_size,
-            self.thread_name.as_deref(),
-        )
-    }
+#[derive(Debug, Default)]
+struct Groups {
+    compute: usize,
+    async_compute: usize,
+    io: usize,
 }
 
 #[derive(Debug)]
 struct TaskPoolInner {
+    /// The groups for the pool
+    ///
+    /// This has to be separate from TaskPoolInner because we have to create an Arc to
+    /// pass into the worker threads, and we must create the worker threads before we can create
+    /// the Vec<JoinHandle<()>> contained within TaskPoolInner
+    groups: Groups,
     threads: Vec<JoinHandle<()>>,
     shutdown_tx: async_channel::Sender<()>,
 }
@@ -82,14 +47,24 @@ impl Drop for TaskPoolInner {
 
 /// A thread pool for executing tasks. Tasks are futures that are being automatically driven by
 /// the pool on threads owned by the pool.
+///
+/// # Scheduling Semantics
+/// Each thread in the pool is assigned to one of three priority groups: Compute, IO, and Async
+/// Compute. Compute is higher priority than IO, which are both higher priority than async compute.
+/// Every task is assigned to a group upon being spawned. A lower priority thread will always prioritize
+/// its specific tasks (i.e. IO tasks on a IO thread), but will run higher priority tasks if it would
+/// otherwise be sitting idle.
+///
+/// For example, under heavy compute workloads, compute tasks will be scheduled to run on the IO and
+/// async compute thread groups, but any IO task will take precedence over any compute task on the IO
+/// threads. Likewise, async compute tasks will never be scheduled on a compute or IO thread.
+///
+/// By default, all threads in the pool are dedicated to compute group. Thread counts can be altered
+/// via [`TaskPoolBuilder`] when constructing the pool.
 #[derive(Debug, Clone)]
 pub struct TaskPool {
-    /// The executor for the pool
-    ///
-    /// This has to be separate from TaskPoolInner because we have to create an Arc<Executor> to
-    /// pass into the worker threads, and we must create the worker threads before we can create
-    /// the Vec<Task<T>> contained within TaskPoolInner
-    executor: Arc<async_executor::Executor<'static>>,
+    /// Inner state of the pool
+    executor: Arc<Executor<'static>>,
 
     /// Inner state of the pool
     inner: Arc<TaskPoolInner>,
@@ -97,65 +72,93 @@ pub struct TaskPool {
 
 impl TaskPool {
     thread_local! {
-        static LOCAL_EXECUTOR: async_executor::LocalExecutor<'static> = async_executor::LocalExecutor::new();
+        static LOCAL_EXECUTOR: LocalExecutor<'static> = LocalExecutor::new();
     }
 
-    /// Create a `TaskPool` with the default configuration.
-    pub fn new() -> Self {
-        TaskPoolBuilder::new().build()
+    /// Get a [`TaskPoolBuilder`] for custom configuration.
+    pub fn build() -> TaskPoolBuilder {
+        TaskPoolBuilder::new()
     }
 
-    fn new_internal(
-        num_threads: Option<usize>,
-        stack_size: Option<usize>,
-        thread_name: Option<&str>,
-    ) -> Self {
+    pub(crate) fn new_internal(builder: TaskPoolBuilder) -> Self {
         let (shutdown_tx, shutdown_rx) = async_channel::unbounded::<()>();
 
-        let executor = Arc::new(async_executor::Executor::new());
+        let mut groups = Groups::default();
+        let total_threads =
+            crate::logical_core_count().clamp(builder.min_total_threads, builder.max_total_threads);
+        tracing::trace!("Assigning {} cores to default task pools", total_threads);
 
-        let num_threads = num_threads.unwrap_or_else(num_cpus::get);
+        let mut remaining_threads = total_threads;
 
-        let threads = (0..num_threads)
-            .map(|i| {
-                let ex = Arc::clone(&executor);
-                let shutdown_rx = shutdown_rx.clone();
+        // Determine the number of IO threads we will use
+        groups.io = builder
+            .io
+            .get_number_of_threads(remaining_threads, total_threads);
 
-                // miri does not support setting thread names
-                // TODO: change back when https://github.com/rust-lang/miri/issues/1717 is fixed
-                #[cfg(not(miri))]
-                let mut thread_builder = {
-                    let thread_name = if let Some(thread_name) = thread_name {
-                        format!("{} ({})", thread_name, i)
-                    } else {
-                        format!("TaskPool ({})", i)
-                    };
-                    thread::Builder::new().name(thread_name)
-                };
-                #[cfg(miri)]
-                let mut thread_builder = {
-                    let _ = i;
-                    let _ = thread_name;
-                    thread::Builder::new()
-                };
+        tracing::trace!("IO Threads: {}", groups.io);
+        remaining_threads = remaining_threads.saturating_sub(groups.io);
 
-                if let Some(stack_size) = stack_size {
-                    thread_builder = thread_builder.stack_size(stack_size);
-                }
+        // Determine the number of async compute threads we will use
+        groups.async_compute = builder
+            .async_compute
+            .get_number_of_threads(remaining_threads, total_threads);
 
-                thread_builder
-                    .spawn(move || {
-                        let shutdown_future = ex.run(shutdown_rx.recv());
-                        // Use unwrap_err because we expect a Closed error
-                        future::block_on(shutdown_future).unwrap_err();
-                    })
-                    .expect("Failed to spawn thread.")
-            })
-            .collect();
+        tracing::trace!("Async Compute Threads: {}", groups.async_compute);
+        remaining_threads = remaining_threads.saturating_sub(groups.async_compute);
+
+        // Determine the number of compute threads we will use
+        // This is intentionally last so that an end user can specify 1.0 as the percent
+        groups.compute = builder
+            .compute
+            .get_number_of_threads(remaining_threads, total_threads);
+        tracing::trace!("Compute Threads: {}", groups.compute);
+
+        let mut thread_counts = vec![0; TaskGroup::MAX_PRIORITY];
+        thread_counts[TaskGroup::Compute.to_priority()] = groups.compute;
+        thread_counts[TaskGroup::IO.to_priority()] = groups.io;
+        thread_counts[TaskGroup::AsyncCompute.to_priority()] = groups.async_compute;
+        let executor = Arc::new(Executor::new(&thread_counts));
+        let mut threads = Vec::with_capacity(total_threads);
+        threads.extend((0..groups.compute).map(|i| {
+            let shutdown_rx = shutdown_rx.clone();
+            let executor = executor.clone();
+            make_thread_builder(&builder, "Compute", i)
+                .spawn(move || {
+                    let future =
+                        executor.run(TaskGroup::Compute.to_priority(), i, shutdown_rx.recv());
+                    // Use unwrap_err because we expect a Closed error
+                    future::block_on(future).unwrap_err();
+                })
+                .expect("Failed to spawn thread.")
+        }));
+        threads.extend((0..groups.io).map(|i| {
+            let shutdown_rx = shutdown_rx.clone();
+            let executor = executor.clone();
+            make_thread_builder(&builder, "IO", i)
+                .spawn(move || {
+                    let future = executor.run(TaskGroup::IO.to_priority(), i, shutdown_rx.recv());
+                    // Use unwrap_err because we expect a Closed error
+                    future::block_on(future).unwrap_err();
+                })
+                .expect("Failed to spawn thread.")
+        }));
+        threads.extend((0..groups.async_compute).map(|i| {
+            let shutdown_rx = shutdown_rx.clone();
+            let executor = executor.clone();
+            make_thread_builder(&builder, "Async Compute", i)
+                .spawn(move || {
+                    let future =
+                        executor.run(TaskGroup::AsyncCompute.to_priority(), i, shutdown_rx.recv());
+                    // Use unwrap_err because we expect a Closed error
+                    future::block_on(future).unwrap_err();
+                })
+                .expect("Failed to spawn thread.")
+        }));
 
         Self {
             executor,
             inner: Arc::new(TaskPoolInner {
+                groups,
                 threads,
                 shutdown_tx,
             }),
@@ -167,26 +170,41 @@ impl TaskPool {
         self.inner.threads.len()
     }
 
-    /// Allows spawning non-`'static` futures on the thread pool. The function takes a callback,
-    /// passing a scope object into it. The scope object provided to the callback can be used
-    /// to spawn tasks. This function will await the completion of all tasks before returning.
+    /// Return the number of threads that can run a given [`TaskGroup`] in the task pool
+    pub fn thread_count_for(&self, group: TaskGroup) -> usize {
+        let groups = &self.inner.groups;
+        match group {
+            TaskGroup::Compute => self.thread_num(),
+            TaskGroup::IO => groups.io + groups.async_compute,
+            TaskGroup::AsyncCompute => groups.async_compute,
+        }
+    }
+
+    /// Allows spawning non-`'static` futures on the thread pool in a specific task group. The
+    /// function takes a callback, passing a scope object into it. The scope object provided
+    /// to the callback can be used to spawn tasks. This function will await the completion of
+    /// all tasks before returning.
     ///
     /// This is similar to `rayon::scope` and `crossbeam::scope`
-    pub fn scope<'scope, F, T>(&self, f: F) -> Vec<T>
+    pub fn scope<'scope, F, T>(&self, group: TaskGroup, f: F) -> Vec<T>
     where
         F: FnOnce(&mut Scope<'scope, T>) + 'scope + Send,
         T: Send + 'static,
     {
+        if self.thread_count_for(group) == 0 {
+            tracing::error!("Attempting to use TaskPool::scope with the {:?} task group, but there are no threads for it!",
+                            group);
+        }
+        // SAFETY: This function blocks until all futures complete, so this future must return
+        // before this function returns. However, rust has no way of knowing
+        // this so we must convert to 'static here to appease the compiler as it is unable to
+        // validate safety.
+        let executor: &Executor = &self.executor;
+        let executor: &'scope Executor = unsafe { mem::transmute(executor) };
         TaskPool::LOCAL_EXECUTOR.with(|local_executor| {
-            // SAFETY: This function blocks until all futures complete, so this future must return
-            // before this function returns. However, rust has no way of knowing
-            // this so we must convert to 'static here to appease the compiler as it is unable to
-            // validate safety.
-            let executor: &async_executor::Executor = &*self.executor;
-            let executor: &'scope async_executor::Executor = unsafe { mem::transmute(executor) };
-            let local_executor: &'scope async_executor::LocalExecutor =
-                unsafe { mem::transmute(local_executor) };
+            let local_executor: &'scope LocalExecutor = unsafe { mem::transmute(local_executor) };
             let mut scope = Scope {
+                group,
                 executor,
                 local_executor,
                 spawned: Vec::new(),
@@ -194,59 +212,68 @@ impl TaskPool {
 
             f(&mut scope);
 
-            if scope.spawned.is_empty() {
-                Vec::default()
-            } else if scope.spawned.len() == 1 {
-                vec![future::block_on(&mut scope.spawned[0])]
-            } else {
-                let fut = async move {
-                    let mut results = Vec::with_capacity(scope.spawned.len());
-                    for task in scope.spawned {
-                        results.push(task.await);
-                    }
+            match scope.spawned.len() {
+                0 => Vec::new(),
+                1 => vec![future::block_on(&mut scope.spawned[0])],
+                _ => {
+                    let fut = async move {
+                        let mut results = Vec::with_capacity(scope.spawned.len());
+                        for task in scope.spawned {
+                            results.push(task.await);
+                        }
 
-                    results
-                };
-
-                // Pin the futures on the stack.
-                pin!(fut);
-
-                // SAFETY: This function blocks until all futures complete, so we do not read/write
-                // the data from futures outside of the 'scope lifetime. However,
-                // rust has no way of knowing this so we must convert to 'static
-                // here to appease the compiler as it is unable to validate safety.
-                let fut: Pin<&mut (dyn Future<Output = Vec<T>>)> = fut;
-                let fut: Pin<&'static mut (dyn Future<Output = Vec<T>> + 'static)> =
-                    unsafe { mem::transmute(fut) };
-
-                // The thread that calls scope() will participate in driving tasks in the pool
-                // forward until the tasks that are spawned by this scope() call
-                // complete. (If the caller of scope() happens to be a thread in
-                // this thread pool, and we only have one thread in the pool, then
-                // simply calling future::block_on(spawned) would deadlock.)
-                let mut spawned = local_executor.spawn(fut);
-                loop {
-                    if let Some(result) = future::block_on(future::poll_once(&mut spawned)) {
-                        break result;
+                        results
                     };
 
-                    self.executor.try_tick();
-                    local_executor.try_tick();
+                    // Pin the futures on the stack.
+                    pin!(fut);
+
+                    // SAFETY: This function blocks until all futures complete, so we do not read/write
+                    // the data from futures outside of the 'scope lifetime. However,
+                    // rust has no way of knowing this so we must convert to 'static
+                    // here to appease the compiler as it is unable to validate safety.
+                    let fut: Pin<&mut (dyn Future<Output = Vec<T>>)> = fut;
+                    let fut: Pin<&'static mut (dyn Future<Output = Vec<T>> + 'static)> =
+                        unsafe { mem::transmute(fut) };
+
+                    // The thread that calls scope() will participate in driving tasks in the pool
+                    // forward until the tasks that are spawned by this scope() call
+                    // complete. (If the caller of scope() happens to be a thread in
+                    // this thread pool, and we only have one thread in the pool, then
+                    // simply calling future::block_on(spawned) would deadlock.)
+                    let mut spawned = local_executor.spawn(fut);
+                    loop {
+                        if let Some(result) = future::block_on(future::poll_once(&mut spawned)) {
+                            break result;
+                        };
+
+                        executor.try_tick(group.to_priority());
+                        local_executor.try_tick();
+                    }
                 }
             }
         })
     }
 
-    /// Spawns a static future onto the thread pool. The returned Task is a future. It can also be
-    /// cancelled and "detached" allowing it to continue running without having to be polled by the
-    /// end-user.
+    /// Spawns a static future onto the thread pool in a group. The returned Task is a future.
+    /// It can also be cancelled and "detached" allowing it to continue running without having to be polled
+    /// by the end-user.
     ///
     /// If the provided future is non-`Send`, [`TaskPool::spawn_local`] should be used instead.
-    pub fn spawn<T>(&self, future: impl Future<Output = T> + Send + 'static) -> Task<T>
+    #[inline]
+    pub fn spawn<T>(
+        &self,
+        group: TaskGroup,
+        future: impl Future<Output = T> + Send + 'static,
+    ) -> Task<T>
     where
         T: Send + 'static,
     {
-        Task::new(self.executor.spawn(future))
+        if self.thread_count_for(group) == 0 {
+            tracing::error!("Attempted to use TaskPool::spawn with the {:?} task group, but there are no threads for it!",
+                            group);
+        }
+        Task::new(self.executor.spawn(group.to_priority(), future))
     }
 
     /// Spawns a static future on the thread-local async executor for the current thread. The task
@@ -264,7 +291,7 @@ impl TaskPool {
 
 impl Default for TaskPool {
     fn default() -> Self {
-        Self::new()
+        TaskPoolBuilder::new().build()
     }
 }
 
@@ -273,22 +300,23 @@ impl Default for TaskPool {
 /// For more information, see [`TaskPool::scope`].
 #[derive(Debug)]
 pub struct Scope<'scope, T> {
-    executor: &'scope async_executor::Executor<'scope>,
-    local_executor: &'scope async_executor::LocalExecutor<'scope>,
-    spawned: Vec<async_executor::Task<T>>,
+    group: TaskGroup,
+    executor: &'scope Executor<'scope>,
+    local_executor: &'scope LocalExecutor<'scope>,
+    spawned: Vec<crate::executor::Task<T>>,
 }
 
 impl<'scope, T: Send + 'scope> Scope<'scope, T> {
-    /// Spawns a scoped future onto the thread pool. The scope *must* outlive
-    /// the provided future. The results of the future will be returned as a part of
-    /// [`TaskPool::scope`]'s return value.
+    /// Spawns a scoped future onto the thread pool into the scope's group. The scope
+    /// *must* outlive the provided future. The results of the future will be returned
+    /// as a part of [`TaskPool::scope`]'s return value.
     ///
     /// If the provided future is non-`Send`, [`Scope::spawn_local`] should be used
     /// instead.
     ///
     /// For more information, see [`TaskPool::scope`].
     pub fn spawn<Fut: Future<Output = T> + 'scope + Send>(&mut self, f: Fut) {
-        let task = self.executor.spawn(f);
+        let task = self.executor.spawn(self.group.to_priority(), f);
         self.spawned.push(task);
     }
 
@@ -304,10 +332,32 @@ impl<'scope, T: Send + 'scope> Scope<'scope, T> {
     }
 }
 
+fn make_thread_builder(
+    builder: &TaskPoolBuilder,
+    prefix: &'static str,
+    idx: usize,
+) -> thread::Builder {
+    let mut thread_builder = {
+        let thread_name = if let Some(ref thread_name) = builder.thread_name {
+            format!("{} ({}, {})", thread_name, prefix, idx)
+        } else {
+            format!("TaskPool ({}, {})", prefix, idx)
+        };
+        thread::Builder::new().name(thread_name)
+    };
+
+    if let Some(stack_size) = builder.stack_size {
+        thread_builder = thread_builder.stack_size(stack_size);
+    }
+
+    thread_builder
+}
+
 #[cfg(test)]
 #[allow(clippy::blacklisted_name)]
 mod tests {
     use super::*;
+    use crate::TaskGroup;
     use std::sync::{
         atomic::{AtomicBool, AtomicI32, Ordering},
         Barrier,
@@ -315,14 +365,14 @@ mod tests {
 
     #[test]
     fn test_spawn() {
-        let pool = TaskPool::new();
+        let pool = TaskPool::default();
 
         let foo = Box::new(42);
         let foo = &*foo;
 
         let count = Arc::new(AtomicI32::new(0));
 
-        let outputs = pool.scope(|scope| {
+        let outputs = pool.scope(TaskGroup::Compute, |scope| {
             for _ in 0..100 {
                 let count_clone = count.clone();
                 scope.spawn(async move {
@@ -346,7 +396,7 @@ mod tests {
 
     #[test]
     fn test_mixed_spawn_local_and_spawn() {
-        let pool = TaskPool::new();
+        let pool = TaskPool::default();
 
         let foo = Box::new(42);
         let foo = &*foo;
@@ -354,7 +404,7 @@ mod tests {
         let local_count = Arc::new(AtomicI32::new(0));
         let non_local_count = Arc::new(AtomicI32::new(0));
 
-        let outputs = pool.scope(|scope| {
+        let outputs = pool.scope(TaskGroup::Compute, |scope| {
             for i in 0..100 {
                 if i % 2 == 0 {
                     let count_clone = non_local_count.clone();
@@ -391,7 +441,7 @@ mod tests {
 
     #[test]
     fn test_thread_locality() {
-        let pool = Arc::new(TaskPool::new());
+        let pool = Arc::new(TaskPool::default());
         let count = Arc::new(AtomicI32::new(0));
         let barrier = Arc::new(Barrier::new(101));
         let thread_check_failed = Arc::new(AtomicBool::new(false));
@@ -402,7 +452,7 @@ mod tests {
             let inner_pool = pool.clone();
             let inner_thread_check_failed = thread_check_failed.clone();
             std::thread::spawn(move || {
-                inner_pool.scope(|scope| {
+                inner_pool.scope(TaskGroup::Compute, |scope| {
                     let inner_count_clone = count_clone.clone();
                     scope.spawn(async move {
                         inner_count_clone.fetch_add(1, Ordering::Release);

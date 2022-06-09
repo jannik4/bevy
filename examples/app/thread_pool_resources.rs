@@ -2,10 +2,11 @@
 //! certain number of threads).
 
 use bevy::prelude::*;
+use bevy::tasks::TaskPoolBuilder;
 
 fn main() {
     App::new()
-        .insert_resource(DefaultTaskPoolOptions::with_num_threads(4))
+        .insert_resource(TaskPoolBuilder::new().threads(4).build())
         .add_plugins(DefaultPlugins)
         .run();
 }
