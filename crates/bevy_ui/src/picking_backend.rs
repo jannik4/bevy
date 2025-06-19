@@ -27,7 +27,7 @@
 use crate::{focus::pick_rounded_rect, prelude::*, UiStack};
 use bevy_app::prelude::*;
 use bevy_ecs::{prelude::*, query::QueryData};
-use bevy_math::{Rect, Vec2};
+use bevy_math::{Rect, Vec2, Vec3Swizzles};
 use bevy_platform::collections::HashMap;
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use bevy_render::prelude::*;
@@ -194,7 +194,7 @@ pub fn ui_picking(
 
         let node_rect = Rect::from_center_size(
             node.global_transform.translation().truncate(),
-            node.node.size(),
+            node.node.size() * node.global_transform.scale().xy(),
         );
 
         // Nodes with Display::None have a (0., 0.) logical rect and can be ignored
