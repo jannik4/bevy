@@ -8,6 +8,7 @@
     light_probes,
 };
 #import bevy_pbr::clustered_forward::ClusterableObjectIndexRanges
+#import bevy_pbr::mesh_view_types::LIGHT_PROBE_FLAG_AFFECTS_LIGHTMAPPED_MESH_DIFFUSE
 
 #ifdef IRRADIANCE_VOLUMES_ARE_USABLE
 
